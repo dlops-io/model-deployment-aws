@@ -3,16 +3,11 @@
 In this tutorial we will deploy a model to AWS SageMaker:
 <img src="images/serverless-model-deployment.png"  width="800">
 
-> Note: The architecture diagram shows the GCP workflow. For AWS, we use:
-> - Amazon S3 instead of Google Cloud Storage
-> - Amazon SageMaker instead of Vertex AI
-> - AWS IAM instead of GCP Service Accounts
-
 ## Setup Environments
 In this tutorial we will setup a container to manage building and deploying models to AWS SageMaker Model Registry and Endpoints.
 
 ### Clone the github repository
-- Clone or download from [here](https://github.com/dlops-io/model-deployment)
+- Clone or download from [here](https://github.com/dlops-io/model-deployment-aws)
 
 ### AWS Services to Enable
 Make sure you have access to the following AWS services:
@@ -20,22 +15,10 @@ Make sure you have access to the following AWS services:
 * Amazon SageMaker
 * AWS IAM
 
-### Setup AWS Credentials
+### AWS Credentials
 Next step is to enable our container to have access to S3 buckets & SageMaker in AWS.
 
-#### Create a local **secrets** folder
-
-It is important to note that we do not want any secure information in Git. So we will manage these files outside of the git folder. At the same level as the `model-deployment-aws` folder create a folder called **secrets**
-
-Your folder structure should look like this:
-```
-   |-model-deployment-aws
-   |-secrets
-```
-
-#### Setup AWS IAM User and Credentials
-
-##### Option 1: Using AWS IAM User (Recommended for local development)
+#### Create AWS IAM User
 1. Go to the [AWS Console](https://console.aws.amazon.com/)
 2. Navigate to IAM (Identity and Access Management)
 3. Create a new IAM user called "model-deployment"
@@ -45,35 +28,6 @@ Your folder structure should look like this:
    - `IAMFullAccess` (needed for SageMaker to create execution roles)
 5. Create access keys for this user
 6. Save the Access Key ID and Secret Access Key
-
-##### Option 2: Using AWS IAM Role (For EC2 or SageMaker instances)
-1. Create an IAM role with the same permissions as above
-2. Attach it to your EC2 instance or SageMaker notebook instance
-
-#### Configure AWS Credentials
-
-You have several options to provide AWS credentials:
-
-##### Option 1: AWS CLI Configuration (Recommended)
-Run the following command on your local machine:
-```bash
-aws configure
-```
-Enter your:
-- AWS Access Key ID
-- AWS Secret Access Key
-- Default region (e.g., us-east-1)
-- Default output format (json)
-
-This will create `~/.aws/credentials` and `~/.aws/config` files that will be mounted into the container.
-
-##### Option 2: Environment Variables
-Export the following environment variables before running the container:
-```bash
-export AWS_ACCESS_KEY_ID=your_access_key_id
-export AWS_SECRET_ACCESS_KEY=your_secret_access_key
-export AWS_REGION=us-east-1
-```
 
 #### Create SageMaker Execution Role
 
@@ -103,81 +57,58 @@ We need a bucket to store the saved model files that will be used by SageMaker t
 **NEVER hardcode AWS credentials directly in scripts or commit them to Git!**
 If you see credentials in any script files, remove them immediately.
 
-### Set Up AWS Credentials Securely
+### Configure AWS Credentials
 
-We've provided a helper script to set up your AWS credentials securely:
+You can provide credentials/config via either the AWS CLI config or direct env vars.
 
+#### Option 1: AWS CLI Configuration (Recommended)
+Run the following command on your local machine:
 ```bash
-bash setup-aws-credentials.sh
+aws configure
 ```
+Enter your:
+- AWS Access Key ID
+- AWS Secret Access Key
+- Default region (e.g., us-east-1)
+- Default output format (json)
 
-**The script offers three options:**
+This will create `~/.aws/credentials` and `~/.aws/config` files that will be mounted into the container.
 
-1. **Use existing AWS CLI configuration** (`~/.aws/credentials`)
-   - Choose this if you've already run `aws configure`
-   - Your existing credentials will be used automatically
-
-2. **Set environment variables temporarily**
-   - Credentials are set for the current terminal session only
-   - Good for testing or one-time use
-   - You'll need to re-enter them each time you open a new terminal
-
-3. **Create a secure secrets file** (Recommended)
-   - Creates `../secrets/aws-credentials.sh` with your credentials
-   - File is protected with restrictive permissions (600)
-   - Automatically loaded by `docker-shell.sh`
-   - Persists between sessions but stays outside your git repository
-
-**What you'll need to provide:**
-- AWS Access Key ID (from your IAM user)
-- AWS Secret Access Key (from your IAM user)
-- AWS Region (default: us-east-1)
-- SageMaker Execution Role ARN (the role you created earlier)
-
-**Example SageMaker Role ARN format:**
-```
-arn:aws:iam::123456789012:role/service-role/AmazonSageMaker-ExecutionRole
+#### Option 2: Environment Variables
+Export the following environment variables before running the container:
+```bash
+export AWS_ACCESS_KEY_ID=your_access_key_id
+export AWS_SECRET_ACCESS_KEY=your_secret_access_key
+export AWS_REGION=us-east-1
 ```
 
 ### Update Configuration
 
-Edit `docker-shell.sh` if needed to update:
+Edit `docker-shell.sh` to update:
 - `S3_MODELS_BUCKET_NAME`: Your S3 bucket name
-- `AWS_REGION`: Your preferred AWS region (default: us-east-1)
+- `SAGEMAKER_ROLE`: The arn for the role you previously created
+- `AWS_REGION`
 
 ### Quick Start Commands
 
 Once you've set up your credentials, here's the typical workflow:
 
 ```bash
-# 1. Set up credentials (first time only)
-bash setup-aws-credentials.sh
-
-# 2. Build and run the container
+# 1. Build and run the container
+chmod +x docker-shell.sh
 sh docker-shell.sh
 
-# 3. Inside the container, prepare and deploy your model
+# 2. Inside the container, prepare and deploy your model
 python cli.py --prepare
 python cli.py --deploy
 python cli.py --predict
+
+# 3. When done, delete resources to avoid charges
+python cli.py --delete
 ```
-
-### Run `docker-shell.sh`
-Based on your OS, run the startup script to make building & running the container easy
-
-- Make sure you are inside the `model-deployment-aws` folder and open a terminal at this location
-- Run `sh docker-shell.sh`
-
-**Note:** The script will automatically:
-- Load your AWS credentials from the secrets file (if it exists)
-- Build the Docker image with the correct AWS packages
-- Mount your AWS credentials into the container
-- Start the container with all necessary environment variables
 
 ### Prepare Model for Deployment
 Our model weights are stored following the serverless training we did in the previous tutorials. In this step, we'll download the model and then upload it to an S3 bucket, enabling SageMaker to access it for deployment to an endpoint.
-
-Since accessing WandB requires permission to Pavlos account, we've instead moved the model to GitHub. In cli.py, you'll see the code for downloading from WandB is commented out to reflect this adjustment.
 
 * Run `python cli.py --prepare`, this will:
   1. Download the model from GitHub
@@ -232,13 +163,17 @@ aws sagemaker delete-endpoint-config --endpoint-config-name <your-endpoint-confi
 aws sagemaker delete-model --model-name <your-model-name>
 ```
 
-## Cost Considerations
+### Using the CLI Script
+You can now run the built-in delete command to remove the deployed resources and uploaded artifacts:
+```bash
+python cli.py --delete
+```
+It will attempt to delete:
+- The SageMaker endpoint from `endpoint_config.json` (if present)
+- The corresponding endpoint configuration and model (best-effort by name convention)
+- The S3 artifacts under `s3://$S3_MODELS_BUCKET_NAME/$BEST_MODEL/`
 
-- **S3 Storage**: Minimal cost for storing model artifacts
-- **SageMaker Endpoint**: Charged per hour while the endpoint is running
-  - ml.m5.xlarge instance: ~$0.23 per hour
-  - Remember to delete endpoints when not in use
-- **Data Transfer**: Minimal costs for predictions
+Make sure to confirm in your AWS console to avoid charges.
 
 ## Troubleshooting
 
@@ -250,7 +185,7 @@ aws sagemaker delete-model --model-name <your-model-name>
 
 2. **Endpoint Creation Fails**:
    - Verify the model.tar.gz was uploaded correctly to S3
-   - Check CloudWatch logs for detailed error messages
+   - Check CloudWatch logs for detailed error messages in your endpoint
 
 3. **Predictions Fail**:
    - Ensure the endpoint is in "InService" status

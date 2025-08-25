@@ -5,6 +5,7 @@ Typical usage example from command line:
         python cli.py --upload
         python cli.py --deploy
         python cli.py --predict
+        python cli.py --delete
 """
 
 import os
@@ -14,16 +15,17 @@ import tarfile
 import argparse
 from glob import glob
 import numpy as np
-import base64
 import json
 import boto3
 import sagemaker
 from sagemaker.tensorflow import TensorFlowModel
 from sagemaker import get_execution_role
+from sagemaker.serializers import JSONSerializer
+from sagemaker.deserializers import JSONDeserializer
 import tensorflow as tf
-
-# # W&B
-# import wandb
+from datetime import datetime
+from PIL import Image
+from botocore.exceptions import ClientError
 
 AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
 S3_MODELS_BUCKET_NAME = os.environ["S3_MODELS_BUCKET_NAME"]
@@ -79,57 +81,18 @@ def prepare():
     except s3_client.exceptions.BucketAlreadyOwnedByYou:
         print(f"Bucket {S3_MODELS_BUCKET_NAME} already owned by you")
 
-    # Use this code if you want to pull your model directly from WandB
-    # WANDB_KEY = os.environ["WANDB_KEY"]
-    # # Login into wandb
-    # wandb.login(key=WANDB_KEY)
-
-    # # Download model artifact from wandb
-    # run = wandb.init()
-    # artifact = run.use_artifact(
-    #     "ac215-harvard/cheese-app-demo/model-mobilenetv2_train_base_True",
-    #     type="model",
-    # )
-    # artifact_dir = artifact.download()
-    # print("artifact_dir", artifact_dir)
-
-    # Download model
     download_file(
-        "https://github.com/dlops-io/models/releases/download/v3.0/mobilenetv2_train_base_True.zip",
+        "https://github.com/dlops-io/model-deployment-aws/releases/download/v1.0/mobilenetv2_train_base_True.zip",
         base_path="artifacts",
         extract=True,
     )
+
     prediction_model_path = (
-        "./artifacts/mobilenetv2_train_base_True/mobilenetv2_train_base_True.keras"
+        "./artifacts/mobilenetv2_train_base_True.keras"
     )
 
     # Load model
     prediction_model = tf.keras.models.load_model(prediction_model_path)
-    # print(prediction_model.summary())
-
-    # Preprocess Image
-    def preprocess_image(bytes_input):
-        decoded = tf.io.decode_jpeg(bytes_input, channels=3)
-        decoded = tf.image.convert_image_dtype(decoded, tf.float32)
-        resized = tf.image.resize(decoded, size=(224, 224))
-        return resized
-
-    @tf.function(input_signature=[tf.TensorSpec([None], tf.string)])
-    def preprocess_function(bytes_inputs):
-        decoded_images = tf.map_fn(
-            preprocess_image, bytes_inputs, dtype=tf.float32, back_prop=False
-        )
-        return {"model_input": decoded_images}
-
-    @tf.function(input_signature=[tf.TensorSpec([None], tf.string)])
-    def serving_function(bytes_inputs):
-        images = preprocess_function(bytes_inputs)
-        results = model_call(**images)
-        return results
-
-    model_call = tf.function(prediction_model.call).get_concrete_function(
-        [tf.TensorSpec(shape=[None, 224, 224, 3], dtype=tf.float32, name="model_input")]
-    )
 
     # Save model locally first
     local_model_dir = f"./artifacts/{BEST_MODEL}"
@@ -139,11 +102,14 @@ def prepare():
     model_export_path = os.path.join(
         local_model_dir, "1"
     )  # SageMaker expects version number
-    tf.saved_model.save(
-        prediction_model,
-        model_export_path,
-        signatures={"serving_default": serving_function},
-    )
+
+    # Export using Keras 3 export() if available, otherwise fall back to tf.saved_model.save
+    if hasattr(prediction_model, "export"):
+        print("Using Keras 3 export()")
+        prediction_model.export(model_export_path)
+    else:
+        print("Using tf.saved_model.save()")
+        tf.saved_model.save(prediction_model, model_export_path)
 
     # Create tar.gz archive for SageMaker
     model_tar_path = f"{local_model_dir}/model.tar.gz"
@@ -181,14 +147,11 @@ def deploy():
     # Model artifact location in S3
     model_data = f"s3://{S3_MODELS_BUCKET_NAME}/{BEST_MODEL}/model.tar.gz"
 
-    # Note: TensorFlowModel will automatically use the appropriate container image
-    # based on the framework_version parameter
-
     # Create SageMaker model
     tensorflow_model = TensorFlowModel(
         model_data=model_data,
         role=role,
-        framework_version="2.12",
+        framework_version="2.13",
         sagemaker_session=sagemaker_session,
         name=BEST_MODEL.replace(".", "-").replace(
             "_", "-"
@@ -197,10 +160,17 @@ def deploy():
 
     # Deploy model to endpoint
     print("Deploying model to SageMaker endpoint...")
+    # Create a timestamped endpoint name to avoid collisions
+    ts = datetime.utcnow().strftime("%Y%m%d%H%M%S")
+    endpoint_name = (
+        BEST_MODEL.replace(".", "-").replace("_", "-") + f"-endpoint-{ts}"
+    )
     predictor = tensorflow_model.deploy(
         initial_instance_count=1,
         instance_type="ml.m5.xlarge",
-        endpoint_name=BEST_MODEL.replace(".", "-").replace("_", "-") + "-endpoint",
+        endpoint_name=endpoint_name,
+        serializer=JSONSerializer(),
+        deserializer=JSONDeserializer(),
     )
 
     print("Model deployed successfully!")
@@ -224,11 +194,15 @@ def predict():
     except FileNotFoundError:
         print("Error: endpoint_config.json not found. Please deploy the model first.")
         print("You can also manually set the endpoint name in the code.")
-        # Fallback to a default endpoint name or prompt user to deploy first
         endpoint_name = BEST_MODEL.replace(".", "-").replace("_", "-") + "-endpoint"
 
-    # Initialize SageMaker runtime client
-    runtime_client = boto3.client("sagemaker-runtime", region_name=AWS_REGION)
+    # Build a SageMaker Predictor that speaks JSON
+    predictor = sagemaker.Predictor(
+        endpoint_name=endpoint_name,
+        sagemaker_session=sagemaker.Session(),
+        serializer=JSONSerializer(),
+        deserializer=JSONDeserializer(),
+    )
 
     # Get a sample image to predict
     image_files = glob(os.path.join("data", "*.jpg"))
@@ -239,51 +213,103 @@ def predict():
         print("No image files found in data directory")
         return
 
-    image_samples = np.random.randint(
-        0, high=len(image_files), size=min(5, len(image_files))
-    )
+    image_samples = np.random.randint(0, high=len(image_files), size=min(5, len(image_files)))
     for img_idx in image_samples:
-        print("Image:", image_files[img_idx])
+        img_path = image_files[img_idx]
+        print("Image:", img_path)
 
-        with open(image_files[img_idx], "rb") as f:
-            image_data = f.read()
+        with Image.open(img_path) as img:
+            img = img.convert("RGB").resize((224, 224))
+            arr = np.asarray(img, dtype=np.float32) / 255.0
 
-        # Convert image to base64
-        b64str = base64.b64encode(image_data).decode("utf-8")
-
-        # Format the request for TensorFlow Serving
-        # The serving_default signature expects bytes_inputs
-        payload = {"instances": [b64str]}  # Send base64 encoded string directly
+        payload = {"instances": [arr.tolist()]}
 
         try:
-            # Invoke endpoint
-            response = runtime_client.invoke_endpoint(
-                EndpointName=endpoint_name,
-                ContentType="application/json",
-                Body=json.dumps(payload),
-            )
-
-            # Parse response
-            result = json.loads(response["Body"].read().decode())
-
+            result = predictor.predict(payload)
             print("Result:", result)
-
-            # Extract predictions
             if "predictions" in result:
                 prediction = result["predictions"][0]
-                prediction_index = prediction.index(max(prediction))
+                prediction_index = int(np.argmax(prediction))
                 print(prediction, prediction_index)
-                print(
-                    "Label:   ",
-                    data_details["index2label"][str(prediction_index)],
-                    "\n",
-                )
+                print("Label:   ", data_details["index2label"][str(prediction_index)], "\n")
             else:
                 print("Unexpected response format:", result)
-
         except Exception as e:
             print(f"Error invoking endpoint: {e}")
             print(f"Make sure the endpoint '{endpoint_name}' exists and is in service")
+
+
+def delete():
+    # Load endpoint configuration if present
+    endpoint_name = None
+    try:
+        with open("endpoint_config.json", "r") as f:
+            endpoint_config = json.load(f)
+            endpoint_name = endpoint_config.get("endpoint_name")
+    except FileNotFoundError:
+        pass
+
+    sm_client = boto3.client("sagemaker", region_name=AWS_REGION)
+    s3_client = boto3.client("s3", region_name=AWS_REGION)
+
+    # Delete endpoint
+    if endpoint_name:
+        try:
+            print(f"Deleting endpoint: {endpoint_name}")
+            sm_client.delete_endpoint(EndpointName=endpoint_name)
+        except ClientError as e:
+            print(f"Warning: could not delete endpoint {endpoint_name}: {e}")
+
+    # Try to derive endpoint-config and model names from our naming scheme
+    model_name = BEST_MODEL.replace(".", "-").replace("_", "-")
+    endpoint_config_name = None
+
+    # Best-effort: list endpoint configs and delete ones referencing our model
+    try:
+        paginator = sm_client.get_paginator("list_endpoint_configs")
+        for page in paginator.paginate():
+            for ec in page.get("EndpointConfigs", []):
+                name = ec.get("EndpointConfigName", "")
+                if model_name in name:
+                    endpoint_config_name = name
+                    print(f"Deleting endpoint config: {endpoint_config_name}")
+                    try:
+                        sm_client.delete_endpoint_config(EndpointConfigName=endpoint_config_name)
+                    except ClientError as e:
+                        print(f"Warning: could not delete endpoint config {endpoint_config_name}: {e}")
+    except ClientError as e:
+        print(f"Warning: list_endpoint_configs failed: {e}")
+
+    # Delete model
+    try:
+        print(f"Deleting model: {model_name}")
+        sm_client.delete_model(ModelName=model_name)
+    except ClientError as e:
+        print(f"Warning: could not delete model {model_name}: {e}")
+
+    # Delete S3 artifacts under BEST_MODEL/
+    prefix = f"{BEST_MODEL}/"
+    try:
+        print(f"Deleting S3 artifacts s3://{S3_MODELS_BUCKET_NAME}/{prefix}")
+        paginator = s3_client.get_paginator("list_objects_v2")
+        to_delete = []
+        for page in paginator.paginate(Bucket=S3_MODELS_BUCKET_NAME, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                to_delete.append({"Key": obj["Key"]})
+                if len(to_delete) == 1000:
+                    s3_client.delete_objects(Bucket=S3_MODELS_BUCKET_NAME, Delete={"Objects": to_delete})
+                    to_delete = []
+        if to_delete:
+            s3_client.delete_objects(Bucket=S3_MODELS_BUCKET_NAME, Delete={"Objects": to_delete})
+    except ClientError as e:
+        print(f"Warning: could not delete S3 artifacts: {e}")
+    
+    # Remove local endpoint_config.json
+    try:
+        os.remove("endpoint_config.json")
+        print("Removed endpoint_config.json")
+    except FileNotFoundError:
+        pass
 
 
 def main(args=None):
@@ -299,6 +325,10 @@ def main(args=None):
     elif args.predict:
         print("Predict using endpoint")
         predict()
+
+    elif args.delete:
+        print("Delete endpoint, model, and S3 artifacts")
+        delete()
 
 
 if __name__ == "__main__":
@@ -325,6 +355,11 @@ if __name__ == "__main__":
         "--test",
         action="store_true",
         help="Test deployment to Vertex AI",
+    )
+    parser.add_argument(
+        "--delete",
+        action="store_true",
+        help="Delete endpoint, endpoint config, model, and S3 artifacts",
     )
 
     args = parser.parse_args()
